@@ -106,7 +106,7 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
 | `insh init` | One-time setup per machine. Generates the master key and writes the config. |
 | `insh add --type env --key K [--stdin]` | Stage a new env var. By default `insh` prompts for the value with input hidden; pass `--stdin` to read it from stdin instead. The value is encrypted immediately and the key name is added to `config.yaml`. Nothing touches the network. |
 | `insh sync` | Two-way sync. Pulls the backend repo, decrypts whatever's there, merges in any keys staged locally, re-encrypts, pushes, and writes one env file per supported shell (`env.sh`, `env.fish`, `env.nu`). |
-| `insh edit` | Opens `$EDITOR` on `config.yaml` so you can reorder or remove keys. The config never contains values, so this is safe. |
+| `insh edit` | Opens `$EDITOR` on `config.yaml` so you can reorder or remove keys. The config never contains values, so this is safe. Removing a key here and then running `insh sync` drops that key from the backend `secrets.enc` and from every generated env file. |
 | `insh help` / `insh version` | Self-explanatory. |
 
 ## Multi-machine setup

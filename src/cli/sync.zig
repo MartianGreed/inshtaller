@@ -97,6 +97,21 @@ pub fn run(gpa: std.mem.Allocator) !void {
     }
     if (drained.items.len > 0) log.info("merged {d} pending key(s)", .{drained.items.len});
 
+    // Step 4.5 — prune. The config file is the declarative source of truth for
+    // which keys belong in this backend. Any key in the decrypted blob or
+    // `pending/` that's NOT listed in `config.yaml` is something the user
+    // removed (e.g. via `insh edit`) and must be dropped from both the next
+    // push and the per-shell env files.
+    var pruned = try pruneByConfig(gpa, &map, &cfg);
+    defer {
+        for (pruned.items) |k| gpa.free(k);
+        pruned.deinit(gpa);
+    }
+    if (pruned.items.len > 0) {
+        log.info("removed {d} key(s) no longer in config.yaml:", .{pruned.items.len});
+        for (pruned.items) |k| log.info("  - {s}", .{k});
+    }
+
     // Step 5 — re-encrypt the full merged map and write it back to the repo.
     // atomicWriteFile → tmp + rename so a concurrent reader never sees a torn blob.
     const merged = try emitEnvLines(gpa, &map);
@@ -332,6 +347,41 @@ fn drainPending(
     return drained;
 }
 
+/// Drop every key from `map` that isn't declared in `cfg.keys`. Returns the
+/// list of removed key names (owned by the caller) so sync can log them.
+/// This is what makes `insh edit` — removing a line from `env:` — actually
+/// take effect on the next sync.
+fn pruneByConfig(gpa: std.mem.Allocator, map: *Map, cfg: *const config_mod.Config) !std.ArrayList([]const u8) {
+    var removed: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (removed.items) |k| gpa.free(k);
+        removed.deinit(gpa);
+    }
+
+    // Gather keys-to-remove first; mutating the hashmap while iterating it
+    // would invalidate the iterator.
+    var to_remove: std.ArrayList([]const u8) = .empty;
+    defer to_remove.deinit(gpa);
+
+    var it = map.inner.iterator();
+    while (it.next()) |e| {
+        if (!cfg.hasKey(e.key_ptr.*)) {
+            try to_remove.append(gpa, e.key_ptr.*);
+        }
+    }
+
+    for (to_remove.items) |k| {
+        if (map.inner.fetchRemove(k)) |kv| {
+            // kv.key is the same allocation the map was holding — transfer
+            // ownership to `removed`.
+            try removed.append(gpa, kv.key);
+            gpa.free(kv.value);
+        }
+    }
+    std.mem.sort([]const u8, removed.items, {}, lessThan);
+    return removed;
+}
+
 /// Write `bytes` to `path` atomically: write to `path.tmp`, fsync, then
 /// rename over `path`. A concurrent shell sourcing the target file always
 /// sees either the old or the new contents — never a half-written file.
@@ -367,6 +417,57 @@ test "parseEnvLines + emitEnvLines roundtrip" {
     const out = try emitEnvLines(gpa, &map);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("BAZ=qux\nFOO=bar\n", out);
+}
+
+test "pruneByConfig drops keys missing from config" {
+    const gpa = std.testing.allocator;
+
+    var map = Map.init(gpa);
+    defer map.deinit();
+    try map.put("KEEP", "one");
+    try map.put("DROP_ME", "two");
+    try map.put("ALSO_DROP", "three");
+
+    var cfg = try config_mod.initEmpty(gpa, "https://example.com/repo.git");
+    defer cfg.deinit();
+    try cfg.addKey("KEEP");
+
+    var removed = try pruneByConfig(gpa, &map, &cfg);
+    defer {
+        for (removed.items) |k| gpa.free(k);
+        removed.deinit(gpa);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), removed.items.len);
+    try std.testing.expectEqualStrings("ALSO_DROP", removed.items[0]);
+    try std.testing.expectEqualStrings("DROP_ME", removed.items[1]);
+
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+    try std.testing.expect(map.inner.get("KEEP") != null);
+    try std.testing.expect(map.inner.get("DROP_ME") == null);
+    try std.testing.expect(map.inner.get("ALSO_DROP") == null);
+}
+
+test "pruneByConfig is a no-op when every key is declared" {
+    const gpa = std.testing.allocator;
+
+    var map = Map.init(gpa);
+    defer map.deinit();
+    try map.put("A", "1");
+    try map.put("B", "2");
+
+    var cfg = try config_mod.initEmpty(gpa, "https://example.com/repo.git");
+    defer cfg.deinit();
+    try cfg.addKey("A");
+    try cfg.addKey("B");
+
+    var removed = try pruneByConfig(gpa, &map, &cfg);
+    defer {
+        for (removed.items) |k| gpa.free(k);
+        removed.deinit(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 0), removed.items.len);
+    try std.testing.expectEqual(@as(usize, 2), map.count());
 }
 
 test "parseSyncConfig rejects embedded credentials in backend repo url" {

@@ -1,4 +1,5 @@
 .claude-modified-files
 .claude/
 .zig-cache/
+.zig-global-cache/
 zig-out/

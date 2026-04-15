@@ -2,6 +2,7 @@ const std = @import("std");
 const paths_mod = @import("../paths.zig");
 const crypto_mod = @import("../crypto.zig");
 const config_mod = @import("../config.zig");
+const git_mod = @import("../git.zig");
 const log = @import("../log.zig");
 
 pub fn run(gpa: std.mem.Allocator) !void {
@@ -40,22 +41,37 @@ pub fn run(gpa: std.mem.Allocator) !void {
         if (fileExists(cfg_path)) {
             const src = try std.fs.cwd().readFileAlloc(gpa, cfg_path, 1 * 1024 * 1024);
             defer gpa.free(src);
-            var existing = config_mod.parse(gpa, src) catch {
-                log.err("existing {s} did not parse; remove it and re-run init", .{cfg_path});
-                std.process.exit(1);
+
+            const repo = repoUrlFromExistingConfig(gpa, src) catch |e| switch (e) {
+                error.InvalidConfig => {
+                    log.err("existing {s} did not parse; remove it and re-run init", .{cfg_path});
+                    std.process.exit(1);
+                },
+                error.CredentialedRepoUrl => {
+                    log.err("existing config contains a backend repo URL with embedded credentials; remove the userinfo from config.yaml and re-run init", .{});
+                    std.process.exit(1);
+                },
+                else => return e,
             };
-            defer existing.deinit();
-            log.info("reusing existing config (repo {s})", .{existing.repo});
-            break :blk try gpa.dupe(u8, existing.repo);
+
+            log.info("reusing existing config (repo {f})", .{git_mod.redactUrl(repo)});
+            break :blk repo;
         }
+
         const raw = try promptLine(gpa, stdin, stdout, "Backend repo URL (e.g. https://github.com/you/secrets.git): ", false);
         defer gpa.free(raw);
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) {
-            log.err("backend repo URL is required", .{});
-            std.process.exit(1);
-        }
-        break :blk try gpa.dupe(u8, trimmed);
+
+        break :blk repoUrlFromPrompt(gpa, raw) catch |e| switch (e) {
+            error.MissingRepoUrl => {
+                log.err("backend repo URL is required", .{});
+                std.process.exit(1);
+            },
+            error.CredentialedRepoUrl => {
+                log.err("backend repo URL must not include embedded credentials; use a plain repo URL and provide the PAT separately", .{});
+                std.process.exit(1);
+            },
+            else => return e,
+        };
     };
     defer gpa.free(repo_url_owned);
     const repo_url = repo_url_owned;
@@ -103,7 +119,8 @@ pub fn run(gpa: std.mem.Allocator) !void {
 
     try stdout.writeAll("\nDone. Next steps:\n");
     try stdout.print("  1) Copy {s} securely to any other machine you want to share secrets with.\n", .{key_path});
-    try stdout.writeAll("  2) Add env vars:      insh add --type env --key NAME --value VALUE\n");
+    try stdout.writeAll("  2) Add env vars:      insh add --type env --key NAME      # hidden prompt\n");
+    try stdout.writeAll("                         printf 'VALUE' | insh add --type env --key NAME --stdin\n");
     try stdout.writeAll("  3) Sync to backend:   insh sync\n");
     try stdout.writeAll("  4) Shell integration: echo 'source ~/.inshtaller/env.sh' >> ~/.zshrc\n");
     try stdout.flush();
@@ -148,6 +165,22 @@ fn promptLine(
     return gpa.dupe(u8, line);
 }
 
+fn repoUrlFromExistingConfig(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    var existing = config_mod.parse(gpa, src) catch return error.InvalidConfig;
+    defer existing.deinit();
+
+    try git_mod.ensureSafeRepoUrl(existing.repo);
+    return gpa.dupe(u8, existing.repo);
+}
+
+fn repoUrlFromPrompt(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.MissingRepoUrl;
+
+    try git_mod.ensureSafeRepoUrl(trimmed);
+    return gpa.dupe(u8, trimmed);
+}
+
 fn writeFileExclusive(path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void {
     var file = try std.fs.cwd().createFile(path, .{
         .exclusive = true,
@@ -179,4 +212,22 @@ fn writeFile(path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void 
     });
     defer file.close();
     try file.writeAll(bytes);
+}
+
+test "repoUrlFromPrompt rejects embedded credentials" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.CredentialedRepoUrl, repoUrlFromPrompt(gpa, " https://user:secret@github.com/me/repo.git\n"));
+}
+
+test "repoUrlFromExistingConfig rejects embedded credentials" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\version: 1
+        \\backend:
+        \\  repo: https://user:secret@github.com/me/repo.git
+        \\env:
+        \\
+    ;
+
+    try std.testing.expectError(error.CredentialedRepoUrl, repoUrlFromExistingConfig(gpa, src));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const paths_mod = @import("../paths.zig");
 const config_mod = @import("../config.zig");
+const git_mod = @import("../git.zig");
 const log = @import("../log.zig");
 
 pub fn run(gpa: std.mem.Allocator) !void {
@@ -36,11 +37,39 @@ pub fn run(gpa: std.mem.Allocator) !void {
 
     const src = try std.fs.cwd().readFileAlloc(gpa, cfg_path, 1 * 1024 * 1024);
     defer gpa.free(src);
-    var cfg = config_mod.parse(gpa, src) catch |e| {
-        log.err("config failed to parse after edit: {s}", .{@errorName(e)});
-        return error.InvalidConfigAfterEdit;
+    var cfg = parseEditedConfig(gpa, src) catch |e| switch (e) {
+        error.CredentialedRepoUrl => {
+            log.err("config contains a backend repo URL with embedded credentials; remove the userinfo before running other commands", .{});
+            return error.InvalidConfigAfterEdit;
+        },
+        else => {
+            log.err("config failed to parse after edit: {s}", .{@errorName(e)});
+            return error.InvalidConfigAfterEdit;
+        },
     };
     defer cfg.deinit();
 
-    log.info("config valid: {d} key(s), repo={s}", .{ cfg.keys.items.len, cfg.repo });
+    log.info("config valid: {d} key(s), repo={f}", .{ cfg.keys.items.len, git_mod.redactUrl(cfg.repo) });
+}
+
+fn parseEditedConfig(gpa: std.mem.Allocator, src: []const u8) !config_mod.Config {
+    var cfg = try config_mod.parse(gpa, src);
+    errdefer cfg.deinit();
+
+    try git_mod.ensureSafeRepoUrl(cfg.repo);
+    return cfg;
+}
+
+test "parseEditedConfig rejects embedded credentials in backend repo url" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\version: 1
+        \\backend:
+        \\  repo: https://user:secret@github.com/me/repo.git
+        \\env:
+        \\  - FOO
+        \\
+    ;
+
+    try std.testing.expectError(error.CredentialedRepoUrl, parseEditedConfig(gpa, src));
 }

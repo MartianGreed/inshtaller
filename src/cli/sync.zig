@@ -43,7 +43,13 @@ pub fn run(gpa: std.mem.Allocator) !void {
     defer gpa.free(cfg_path);
     const cfg_src = try std.fs.cwd().readFileAlloc(gpa, cfg_path, 1 * 1024 * 1024);
     defer gpa.free(cfg_src);
-    var cfg = try config_mod.parse(gpa, cfg_src);
+    var cfg = parseSyncConfig(gpa, cfg_src) catch |e| switch (e) {
+        error.CredentialedRepoUrl => {
+            log.err("config contains a backend repo URL with embedded credentials; remove the userinfo before syncing", .{});
+            return error.CredentialedRepoUrl;
+        },
+        else => return e,
+    };
     defer cfg.deinit();
 
     const state_dir = try p.state();
@@ -345,6 +351,14 @@ fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, 
     try std.fs.cwd().rename(tmp_path, path);
 }
 
+fn parseSyncConfig(gpa: std.mem.Allocator, src: []const u8) !config_mod.Config {
+    var cfg = try config_mod.parse(gpa, src);
+    errdefer cfg.deinit();
+
+    try git_mod.ensureSafeRepoUrl(cfg.repo);
+    return cfg;
+}
+
 test "parseEnvLines + emitEnvLines roundtrip" {
     const gpa = std.testing.allocator;
     var map = Map.init(gpa);
@@ -353,4 +367,18 @@ test "parseEnvLines + emitEnvLines roundtrip" {
     const out = try emitEnvLines(gpa, &map);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("BAZ=qux\nFOO=bar\n", out);
+}
+
+test "parseSyncConfig rejects embedded credentials in backend repo url" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\version: 1
+        \\backend:
+        \\  repo: https://user:secret@github.com/me/repo.git
+        \\env:
+        \\  - FOO
+        \\
+    ;
+
+    try std.testing.expectError(error.CredentialedRepoUrl, parseSyncConfig(gpa, src));
 }

@@ -5,6 +5,7 @@ pub const askpass_env = "INSH_ASKPASS";
 
 pub const RunError = error{
     GitFailed,
+    CredentialedRepoUrl,
 } || std.process.Child.RunError || std.mem.Allocator.Error;
 
 pub const Result = struct {
@@ -66,16 +67,14 @@ pub fn runOpts(
     };
 
     if (code != 0 and !opts.quiet_on_failure) {
-        // Surface what git actually said. PAT is injected via GIT_ASKPASS, never
-        // in argv/URL, so stderr is safe to log.
         log.err("git command failed (exit {d}): {f}", .{ code, argvForLog(argv) });
         const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\r\n");
         if (stderr_trimmed.len > 0) {
-            log.err("git stderr:\n{s}", .{stderr_trimmed});
+            log.err("git stderr:\n{f}", .{redactText(stderr_trimmed)});
         }
         const stdout_trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
         if (stdout_trimmed.len > 0) {
-            log.err("git stdout:\n{s}", .{stdout_trimmed});
+            log.err("git stdout:\n{f}", .{redactText(stdout_trimmed)});
         }
     }
 
@@ -97,10 +96,61 @@ const ArgvFormatter = struct {
     pub fn format(self: ArgvFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
         for (self.argv, 0..) |arg, i| {
             if (i > 0) try w.writeByte(' ');
-            try w.writeAll(arg);
+            try writeRedactedUrl(w, arg);
         }
     }
 };
+
+const TextFormatter = struct {
+    text: []const u8,
+
+    pub fn format(self: TextFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
+        var i: usize = 0;
+        while (i < self.text.len) {
+            const scheme_idx = std.mem.indexOfPos(u8, self.text, i, "://") orelse {
+                try w.writeAll(self.text[i..]);
+                return;
+            };
+
+            var start = scheme_idx;
+            while (start > i and isSchemeChar(self.text[start - 1])) : (start -= 1) {}
+
+            var end = scheme_idx + 3;
+            while (end < self.text.len and !isUrlDelimiter(self.text[end])) : (end += 1) {}
+
+            const candidate = self.text[start..end];
+            if (userInfoRange(candidate)) |_| {
+                try w.writeAll(self.text[i..start]);
+                try writeRedactedUrl(w, candidate);
+                i = end;
+                continue;
+            }
+
+            try w.writeAll(self.text[i..end]);
+            i = end;
+        }
+    }
+};
+
+pub fn redactUrl(url: []const u8) RedactedUrlFormatter {
+    return .{ .url = url };
+}
+
+pub fn redactText(text: []const u8) TextFormatter {
+    return .{ .text = text };
+}
+
+const RedactedUrlFormatter = struct {
+    url: []const u8,
+
+    pub fn format(self: RedactedUrlFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
+        try writeRedactedUrl(w, self.url);
+    }
+};
+
+pub fn ensureSafeRepoUrl(url: []const u8) RunError!void {
+    if (userInfoRange(url) != null) return error.CredentialedRepoUrl;
+}
 
 pub fn injectUsername(gpa: std.mem.Allocator, url: []const u8) ![]u8 {
     const https_prefix = "https://";
@@ -126,6 +176,8 @@ pub fn cloneOrFetch(
     dest: []const u8,
     self_exe: []const u8,
 ) !void {
+    try ensureSafeRepoUrl(repo_url);
+
     const auth_url = try injectUsername(gpa, repo_url);
     defer gpa.free(auth_url);
 
@@ -187,6 +239,44 @@ pub fn commitAndPush(
     if (!r3.ok()) return error.GitFailed;
 }
 
+fn writeRedactedUrl(w: *std.io.Writer, url: []const u8) std.io.Writer.Error!void {
+    const range = userInfoRange(url) orelse {
+        try w.writeAll(url);
+        return;
+    };
+
+    try w.writeAll(url[0..range.start]);
+    try w.writeAll("[REDACTED]");
+    try w.writeAll(url[range.at_index..]);
+}
+
+const UserInfoRange = struct {
+    start: usize,
+    at_index: usize,
+};
+
+fn userInfoRange(url: []const u8) ?UserInfoRange {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const authority_start = scheme_end + 3;
+
+    const authority_len = std.mem.indexOfAnyPos(u8, url, authority_start, "/?#") orelse url.len;
+    const authority = url[authority_start..authority_len];
+    const at_rel = std.mem.indexOfScalar(u8, authority, '@') orelse return null;
+
+    return .{
+        .start = authority_start,
+        .at_index = authority_start + at_rel,
+    };
+}
+
+fn isSchemeChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.';
+}
+
+fn isUrlDelimiter(c: u8) bool {
+    return std.ascii.isWhitespace(c) or c == '\'' or c == '"' or c == '<' or c == '>';
+}
+
 test "injectUsername adds oauth2 to bare https url" {
     const gpa = std.testing.allocator;
     const out = try injectUsername(gpa, "https://github.com/me/repo.git");
@@ -206,4 +296,21 @@ test "injectUsername leaves ssh url unchanged" {
     const out = try injectUsername(gpa, "git@github.com:me/repo.git");
     defer gpa.free(out);
     try std.testing.expectEqualStrings("git@github.com:me/repo.git", out);
+}
+
+test "ensureSafeRepoUrl rejects embedded credentials" {
+    try std.testing.expectError(error.CredentialedRepoUrl, ensureSafeRepoUrl("https://user:secret@github.com/me/repo.git"));
+}
+
+test "redactUrl hides userinfo" {
+    var buf: [128]u8 = undefined;
+    const printed = try std.fmt.bufPrint(&buf, "{f}", .{redactUrl("https://user:secret@github.com/me/repo.git")});
+    try std.testing.expectEqualStrings("https://[REDACTED]@github.com/me/repo.git", printed);
+}
+
+test "redactText hides credentialed urls inline" {
+    var buf: [256]u8 = undefined;
+    const printed = try std.fmt.bufPrint(&buf, "{f}", .{redactText("fatal: could not read from https://user:secret@github.com/me/repo.git\n")});
+    try std.testing.expect(std.mem.indexOf(u8, printed, "user:secret") == null);
+    try std.testing.expectEqualStrings("fatal: could not read from https://[REDACTED]@github.com/me/repo.git\n", printed);
 }

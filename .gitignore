@@ -1,3 +1,4 @@
 .claude-modified-files
-.zig-cache
-zig-out
+.claude/
+.zig-cache/
+zig-out/

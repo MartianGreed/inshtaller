@@ -85,8 +85,9 @@ fn printUsage() !void {
         \\COMMANDS
         \\  init                              Create ~/.inshtaller/, generate a private master key,
         \\                                    prompt for GitHub PAT + private backend repo URL.
-        \\  add --type env --key K --value V  Stage an env var. Value is encrypted locally; only
-        \\                                    the key name touches the config file.
+        \\  add --type env --key K [--stdin]  Stage an env var. The value comes from a hidden
+        \\                                    prompt by default, or stdin when --stdin is set;
+        \\                                    only the key name touches the config file.
         \\  sync                              Two-way sync with the backend repo. Decrypts remote
         \\                                    env vars and writes one env file per supported
         \\                                    shell (bash/zsh, fish, nushell); pushes any

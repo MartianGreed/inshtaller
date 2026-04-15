@@ -72,8 +72,8 @@ insh init
 # → writes   ~/.inshtaller/github_token
 # → writes   ~/.inshtaller/config.yaml
 
-insh add --type env --key OPENAI_API_KEY --value sk-xxxxxxxx
-insh add --type env --key DATABASE_URL   --value postgres://user:pw@host/db
+insh add --type env --key OPENAI_API_KEY
+printf 'postgres://user:pw@host/db' | insh add --type env --key DATABASE_URL --stdin
 
 insh sync
 # → clones/pulls the backend repo
@@ -104,7 +104,7 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
 | Command | Purpose |
 | --- | --- |
 | `insh init` | One-time setup per machine. Generates the master key and writes the config. |
-| `insh add --type env --key K --value V` | Stage a new env var. The value is encrypted immediately and the key name is added to `config.yaml`. Nothing touches the network. |
+| `insh add --type env --key K [--stdin]` | Stage a new env var. By default `insh` prompts for the value with input hidden; pass `--stdin` to read it from stdin instead. The value is encrypted immediately and the key name is added to `config.yaml`. Nothing touches the network. |
 | `insh sync` | Two-way sync. Pulls the backend repo, decrypts whatever's there, merges in any keys staged locally, re-encrypts, pushes, and writes one env file per supported shell (`env.sh`, `env.fish`, `env.nu`). |
 | `insh edit` | Opens `$EDITOR` on `config.yaml` so you can reorder or remove keys. The config never contains values, so this is safe. |
 | `insh help` / `insh version` | Self-explanatory. |

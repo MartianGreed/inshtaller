@@ -2,6 +2,7 @@ const std = @import("std");
 const paths_mod = @import("paths.zig");
 const log = @import("log.zig");
 const git = @import("git.zig");
+const runtime = @import("runtime.zig");
 
 const cli_init = @import("cli/init.zig");
 const cli_sync = @import("cli/sync.zig");
@@ -12,18 +13,17 @@ pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
-pub fn main() !void {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    runtime.init(init.io);
+    const gpa = init.gpa;
+    const home = init.environ_map.get("HOME") orelse return error.NoHomeDir;
 
-    if (std.posix.getenv(git.askpass_env) != null) {
-        try runAskpass(gpa);
+    if (init.environ_map.get(git.askpass_env) != null) {
+        try runAskpass(gpa, home);
         return;
     }
 
-    const argv = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, argv);
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len < 2) {
         try printUsage();
@@ -33,13 +33,13 @@ pub fn main() !void {
     const cmd = argv[1];
 
     if (std.mem.eql(u8, cmd, "init")) {
-        try cli_init.run(gpa);
+        try cli_init.run(gpa, home, init.environ_map.get("INSH_GITHUB_TOKEN"), argv[2..]);
     } else if (std.mem.eql(u8, cmd, "sync")) {
-        try cli_sync.run(gpa);
+        try cli_sync.run(gpa, home, init.io, init.environ_map);
     } else if (std.mem.eql(u8, cmd, "edit")) {
-        try cli_edit.run(gpa);
+        try cli_edit.run(gpa, home, init.environ_map.get("EDITOR") orelse "vi", init.io);
     } else if (std.mem.eql(u8, cmd, "add")) {
-        try cli_add.run(gpa, argv[2..]);
+        try cli_add.run(gpa, home, argv[2..]);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
@@ -51,14 +51,14 @@ pub fn main() !void {
     }
 }
 
-fn runAskpass(gpa: std.mem.Allocator) !void {
-    var p = try paths_mod.Paths.init(gpa);
+fn runAskpass(gpa: std.mem.Allocator, home: []const u8) !void {
+    var p = try paths_mod.Paths.init(gpa, home);
     defer p.deinit();
 
     const token_path = try p.token();
     defer gpa.free(token_path);
 
-    const token = std.fs.cwd().readFileAlloc(gpa, token_path, 64 * 1024) catch {
+    const token = std.Io.Dir.cwd().readFileAlloc(runtime.io(), token_path, gpa, .limited(64 * 1024)) catch {
         std.process.exit(1);
     };
     defer gpa.free(token);
@@ -66,7 +66,7 @@ fn runAskpass(gpa: std.mem.Allocator) !void {
     const trimmed = std.mem.trim(u8, token, " \t\r\n");
 
     var out_buf: [8192]u8 = undefined;
-    var out_w = std.fs.File.stdout().writer(&out_buf);
+    var out_w = std.Io.File.stdout().writer(runtime.io(), &out_buf);
     try out_w.interface.writeAll(trimmed);
     try out_w.interface.writeByte('\n');
     try out_w.interface.flush();
@@ -74,7 +74,7 @@ fn runAskpass(gpa: std.mem.Allocator) !void {
 
 fn printUsage() !void {
     var buf: [2048]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.stdout().writer(runtime.io(), &buf);
     const out = &w.interface;
     try out.writeAll(
         \\insh — encrypted env var sync for servers you call home
@@ -83,8 +83,11 @@ fn printUsage() !void {
         \\  insh <command> [options]
         \\
         \\COMMANDS
-        \\  init                              Create ~/.inshtaller/, generate a private master key,
+        \\  init [key options]                Create ~/.inshtaller/, set up the master key, and
         \\                                    prompt for GitHub PAT + private backend repo URL.
+        \\    --key-file PATH                 Import an existing raw 32-byte master key.
+        \\    --key-prompt                    Prompt for an existing 64-character hex key.
+        \\    --force                         Replace a different existing key during import.
         \\  add --type env --key K [--stdin]  Stage an env var. The value comes from a hidden
         \\                                    prompt by default, or stdin when --stdin is set;
         \\                                    only the key name touches the config file.
@@ -104,8 +107,8 @@ fn printUsage() !void {
         \\    nu      source ~/.inshtaller/env.nu    (add to $nu.config-path)
         \\
         \\SECURITY
-        \\  Master key lives at ~/.inshtaller/master.key (mode 0600) and never leaves the device.
-        \\  It is NOT pushed to the backend repo. Copy it out-of-band to new machines.
+        \\  Master key lives at ~/.inshtaller/master.key (mode 0600). It is NOT pushed to the
+        \\  backend repo. Transfer it only through a trusted channel when adding a machine.
         \\
     );
     try out.flush();
@@ -113,11 +116,14 @@ fn printUsage() !void {
 
 fn printVersion() !void {
     var buf: [64]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.stdout().writer(runtime.io(), &buf);
     try w.interface.writeAll("insh 0.1.0\n");
     try w.interface.flush();
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    _ = cli_init;
+    _ = cli_sync;
+    _ = cli_edit;
+    _ = cli_add;
 }

@@ -24,8 +24,9 @@ It is intentionally tiny: one binary, zero runtime dependencies other than
            └───────────────────┘
 ```
 
-- The **master key** is generated on `insh init` and never leaves the device.
-  It encrypts every env var value using XChaCha20-Poly1305.
+- The **master key** is generated on the first `insh init` and imported on
+  additional machines through a trusted channel. It encrypts every env var
+  value using XChaCha20-Poly1305 and is never pushed to the backend.
 - The **GitHub PAT** is stored locally (0600) and injected into `git` via
   `GIT_ASKPASS` — it never appears in argv, URLs, or logs.
 - The backend repo stores **one file**, `secrets.enc`: a single authenticated
@@ -36,7 +37,7 @@ It is intentionally tiny: one binary, zero runtime dependencies other than
 
 ## Install
 
-Requirements: **Zig 0.15.2** and `git` on `$PATH`.
+Requirements: **Zig 0.16.0** and `git` on `$PATH`.
 
 ```sh
 git clone https://github.com/<you>/inshtaller.git
@@ -103,7 +104,7 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
 
 | Command | Purpose |
 | --- | --- |
-| `insh init` | One-time setup per machine. Generates the master key and writes the config. |
+| `insh init [--key-file PATH \| --key-prompt] [--force]` | One-time setup per machine. Generates a master key by default, imports an exact 32-byte raw key with `--key-file`, or securely prompts for its 64-character hex form with `--key-prompt`. `--force` explicitly replaces a different existing key. |
 | `insh add --type env --key K [--stdin]` | Stage a new env var. By default `insh` prompts for the value with input hidden; pass `--stdin` to read it from stdin instead. The value is encrypted immediately and the key name is added to `config.yaml`. Nothing touches the network. |
 | `insh sync` | Two-way sync. Pulls the backend repo, decrypts whatever's there, merges in any keys staged locally, re-encrypts, pushes, and writes one env file per supported shell (`env.sh`, `env.fish`, `env.nu`). |
 | `insh edit` | Opens `$EDITOR` on `config.yaml` so you can reorder or remove keys. The config never contains values, so this is safe. Removing a key here and then running `insh sync` drops that key from the backend `secrets.enc` and from every generated env file. |
@@ -112,13 +113,22 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
 ## Multi-machine setup
 
 1. On machine A: `insh init`, `insh add …`, `insh sync`.
-2. Copy `~/.inshtaller/master.key` to machine B over a trusted channel
-   (scp, USB, password manager). This file is the root of trust.
-3. On machine B: run `insh init`, choose the same repo URL, and provide a PAT
-   (the PAT can differ per machine).
-4. Because you kept B's newly-generated key, overwrite it:
-   `mv ~/.inshtaller/master.key.from-A ~/.inshtaller/master.key`
-5. `insh sync` on B — your vars appear in `~/.inshtaller/env.sh`.
+2. Transfer `~/.inshtaller/master.key` to machine B over a trusted channel
+   such as `scp`, USB, or a password manager. This file is the root of trust.
+3. On machine B, import the raw file during setup:
+   `insh init --key-file ~/master.key.from-A`. Choose the same repo URL and
+   provide a PAT; the PAT can differ per machine.
+4. `insh sync` on B — your vars appear in the generated env files.
+
+For password managers that store text, convert the key to hex on machine A
+with `xxd -p -c 32 ~/.inshtaller/master.key`, then run
+`insh init --key-prompt` on machine B and paste the 64-character value into
+the hidden prompt. Key material is deliberately never accepted directly in a
+command-line argument, where shell history and process listings could expose
+it.
+
+If machine B already has the same key, init safely reuses it. If it has a
+different key, init refuses to replace it unless `--force` is also supplied.
 
 > On first sync against a repo that has other files besides `secrets.enc` and
 > `README*`, `insh` refuses to continue. This prevents accidentally pointing at
@@ -153,8 +163,8 @@ secrets.enc          [24-byte nonce][ciphertext][16-byte Poly1305 tag]
 **What's plaintext:** `config.yaml` contains key names (`OPENAI_API_KEY`, …)
 but no values.
 
-**What never crosses the network:** the master key. Physically copy it to each
-machine you want to sync on.
+**What never reaches the backend:** the master key. Transfer it out-of-band to
+each machine you want to sync through a channel you trust.
 
 **What's kept out of logs:** secret values are wrapped in a `Secret` type
 whose format output is always `[REDACTED]`. The logger never accepts raw

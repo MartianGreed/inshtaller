@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 pub const root_dir_name = ".inshtaller";
 
@@ -7,8 +8,7 @@ pub const Paths = struct {
     home: []u8,
     root: []u8,
 
-    pub fn init(gpa: std.mem.Allocator) !Paths {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    pub fn init(gpa: std.mem.Allocator, home: []const u8) !Paths {
         const home_copy = try gpa.dupe(u8, home);
         errdefer gpa.free(home_copy);
         const root = try std.fs.path.join(gpa, &.{ home_copy, root_dir_name });
@@ -66,6 +66,6 @@ pub const Paths = struct {
     }
 
     pub fn ensureRoot(self: Paths) !void {
-        try std.fs.cwd().makePath(self.root);
+        try std.Io.Dir.cwd().createDirPath(runtime.io(), self.root);
     }
 };

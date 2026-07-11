@@ -4,8 +4,9 @@ const crypto_mod = @import("../crypto.zig");
 const config_mod = @import("../config.zig");
 const log = @import("../log.zig");
 const Secret = @import("../log.zig").Secret;
+const runtime = @import("../runtime.zig");
 
-pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
+pub fn run(gpa: std.mem.Allocator, home: []const u8, args: []const []const u8) !void {
     const parsed = parseArgs(args) catch |e| switch (e) {
         error.InsecureValueArgument => {
             log.err("--value is no longer accepted because argv is visible to other local processes; use the hidden prompt or pass --stdin", .{});
@@ -27,7 +28,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const value = try readSecretValue(gpa, parsed.read_from_stdin);
     defer gpa.free(value);
 
-    var p = try paths_mod.Paths.init(gpa);
+    var p = try paths_mod.Paths.init(gpa, home);
     defer p.deinit();
 
     const key_path = try p.masterKey();
@@ -39,7 +40,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
 
     const cfg_path = try p.config();
     defer gpa.free(cfg_path);
-    const cfg_src = std.fs.cwd().readFileAlloc(gpa, cfg_path, 1 * 1024 * 1024) catch |e| {
+    const cfg_src = std.Io.Dir.cwd().readFileAlloc(runtime.io(), cfg_path, gpa, .limited(1 * 1024 * 1024)) catch |e| {
         log.err("could not read {s}: {s}. Run `insh init` first.", .{ cfg_path, @errorName(e) });
         return error.NotInitialized;
     };
@@ -55,7 +56,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const []const u8) !void {
 
     const pending_dir = try p.pending();
     defer gpa.free(pending_dir);
-    try std.fs.cwd().makePath(pending_dir);
+    try std.Io.Dir.cwd().createDirPath(runtime.io(), pending_dir);
 
     const enc = try crypto_mod.encrypt(gpa, value, master);
     defer gpa.free(enc);
@@ -117,24 +118,26 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
 
 fn readSecretValue(gpa: std.mem.Allocator, read_from_stdin: bool) ![]u8 {
     if (read_from_stdin) {
-        const raw = try std.fs.File.stdin().readToEndAlloc(gpa, 1 * 1024 * 1024);
+        var buffer: [4096]u8 = undefined;
+        var reader = std.Io.File.stdin().readerStreaming(runtime.io(), &buffer);
+        const raw = try reader.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024));
         errdefer gpa.free(raw);
         const trimmed = std.mem.trim(u8, raw, "\r\n");
         if (trimmed.len == 0) return error.MissingValue;
         return gpa.dupe(u8, trimmed);
     }
 
-    if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
+    if (!(std.Io.File.stdin().isTty(runtime.io()) catch false)) {
         log.err("refusing to prompt for a secret on non-interactive stdin; pass --stdin to read the value from stdin", .{});
         return error.NonInteractiveStdin;
     }
 
     var stdin_buf: [4096]u8 = undefined;
-    var stdin_r = std.fs.File.stdin().reader(&stdin_buf);
+    var stdin_r = std.Io.File.stdin().reader(runtime.io(), &stdin_buf);
     const stdin = &stdin_r.interface;
 
     var stdout_buf: [256]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_w = std.Io.File.stdout().writer(runtime.io(), &stdout_buf);
     const stdout = &stdout_w.interface;
 
     const raw = try promptLine(gpa, stdin, stdout, "Secret value (input hidden): ", true);
@@ -156,18 +159,18 @@ fn isValidKey(key: []const u8) bool {
 }
 
 fn readMasterKey(path: []const u8) !crypto_mod.Key {
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(runtime.io(), path, std.heap.page_allocator, .limited(crypto_mod.key_length + 1));
+    defer std.heap.page_allocator.free(bytes);
+    if (bytes.len != crypto_mod.key_length) return error.InvalidKeyFile;
     var key: crypto_mod.Key = undefined;
-    const n = try file.readAll(&key);
-    if (n != key.len) return error.InvalidKeyFile;
+    @memcpy(&key, bytes);
     return key;
 }
 
 fn promptLine(
     gpa: std.mem.Allocator,
-    reader: *std.io.Reader,
-    writer: *std.io.Writer,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
     prompt: []const u8,
     hide_input: bool,
 ) ![]u8 {
@@ -176,7 +179,7 @@ fn promptLine(
 
     const stdin_fd = std.posix.STDIN_FILENO;
     var original: ?std.posix.termios = null;
-    if (hide_input and std.posix.isatty(stdin_fd)) {
+    if (hide_input and (std.Io.File.stdin().isTty(runtime.io()) catch false)) {
         if (std.posix.tcgetattr(stdin_fd)) |t| {
             original = t;
             var modified = t;
@@ -199,20 +202,20 @@ fn promptLine(
     return gpa.dupe(u8, line);
 }
 
-fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void {
+fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: std.posix.mode_t) !void {
     const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
     defer gpa.free(tmp_path);
 
     {
-        var file = try std.fs.cwd().createFile(tmp_path, .{
-            .mode = mode,
+        var file = try std.Io.Dir.cwd().createFile(runtime.io(), tmp_path, .{
+            .permissions = .fromMode(mode),
             .truncate = true,
         });
-        defer file.close();
-        try file.writeAll(bytes);
-        try file.sync();
+        defer file.close(runtime.io());
+        try file.writeStreamingAll(runtime.io(), bytes);
+        try file.sync(runtime.io());
     }
-    try std.fs.cwd().rename(tmp_path, path);
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, runtime.io());
 }
 
 test "isValidKey accepts standard env names" {

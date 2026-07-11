@@ -26,13 +26,14 @@ const config_mod = @import("../config.zig");
 const git_mod = @import("../git.zig");
 const log = @import("../log.zig");
 const provider = @import("../provider.zig");
+const runtime = @import("../runtime.zig");
 
 /// Entry point for `insh sync`. Runs the full pipeline documented at the top
 /// of this file. Returns an error on any unrecoverable failure (bad config,
 /// wrong-repo guard, git failure, crypto auth failure, I/O error); all paths
 /// already log a human-readable reason before returning.
-pub fn run(gpa: std.mem.Allocator) !void {
-    var p = try paths_mod.Paths.init(gpa);
+pub fn run(gpa: std.mem.Allocator, home: []const u8, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var p = try paths_mod.Paths.init(gpa, home);
     defer p.deinit();
 
     const key_path = try p.masterKey();
@@ -41,7 +42,7 @@ pub fn run(gpa: std.mem.Allocator) !void {
 
     const cfg_path = try p.config();
     defer gpa.free(cfg_path);
-    const cfg_src = try std.fs.cwd().readFileAlloc(gpa, cfg_path, 1 * 1024 * 1024);
+    const cfg_src = try std.Io.Dir.cwd().readFileAlloc(runtime.io(), cfg_path, gpa, .limited(1 * 1024 * 1024));
     defer gpa.free(cfg_src);
     var cfg = parseSyncConfig(gpa, cfg_src) catch |e| switch (e) {
         error.CredentialedRepoUrl => {
@@ -55,12 +56,12 @@ pub fn run(gpa: std.mem.Allocator) !void {
     const state_dir = try p.state();
     defer gpa.free(state_dir);
 
-    const self_exe = try std.fs.selfExePathAlloc(gpa);
+    const self_exe = try std.process.executablePathAlloc(runtime.io(), gpa);
     defer gpa.free(self_exe);
 
     // Step 1 — network. Idempotent: clones on first run, fetches + resets on later runs.
     log.info("fetching backend repo", .{});
-    try git_mod.cloneOrFetch(gpa, cfg.repo, state_dir, self_exe);
+    try git_mod.cloneOrFetch(gpa, io, environ, cfg.repo, state_dir, self_exe);
 
     // Step 2 — guard. Runs BEFORE decrypt so a misconfigured repo URL can't
     // clobber state. If this passes we trust the repo for the rest of the run.
@@ -73,7 +74,7 @@ pub fn run(gpa: std.mem.Allocator) !void {
     // not an error. Every other read/crypto failure IS an error.
     const blob_path = try p.secretsBlob();
     defer gpa.free(blob_path);
-    if (std.fs.cwd().readFileAlloc(gpa, blob_path, 16 * 1024 * 1024)) |blob| {
+    if (std.Io.Dir.cwd().readFileAlloc(runtime.io(), blob_path, gpa, .limited(16 * 1024 * 1024))) |blob| {
         defer gpa.free(blob);
         const pt = try crypto_mod.decrypt(gpa, blob, master);
         defer gpa.free(pt);
@@ -88,7 +89,7 @@ pub fn run(gpa: std.mem.Allocator) !void {
     // `insh add` stages override/extend remote values (last-write-wins by key).
     const pending_dir = try p.pending();
     defer gpa.free(pending_dir);
-    std.fs.cwd().makePath(pending_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(runtime.io(), pending_dir) catch {};
     const drained = try drainPending(gpa, pending_dir, master, &map);
     defer {
         for (drained.items) |path| gpa.free(path);
@@ -127,13 +128,13 @@ pub fn run(gpa: std.mem.Allocator) !void {
     log.info("pushing to backend", .{});
     const msg = try std.fmt.allocPrint(gpa, "chore: insh sync", .{});
     defer gpa.free(msg);
-    try git_mod.commitAndPush(gpa, state_dir, msg, self_exe);
+    try git_mod.commitAndPush(gpa, io, environ, state_dir, msg, self_exe);
 
     // Pending cleanup runs AFTER the push succeeds — crash safety. If the
     // push failed above, we already returned, pending files are intact, and
     // the next `insh sync` replays them.
     for (drained.items) |path| {
-        std.fs.cwd().deleteFile(path) catch |e| {
+        std.Io.Dir.cwd().deleteFile(runtime.io(), path) catch |e| {
             log.warn("could not delete {s}: {s}", .{ path, @errorName(e) });
         };
     }
@@ -175,7 +176,7 @@ fn collectEnvs(gpa: std.mem.Allocator, map: *const Map) ![]provider.Env {
 /// Render the full env file (header + one export per env) for a specific
 /// provider into an owned byte buffer. Caller frees.
 fn renderProviderFile(gpa: std.mem.Allocator, pv: provider.Provider, envs: []const provider.Env) ![]u8 {
-    var aw: std.io.Writer.Allocating = .init(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try pv.writeFile(&aw.writer, envs);
     return aw.toOwnedSlice();
@@ -185,7 +186,7 @@ fn renderProviderFile(gpa: std.mem.Allocator, pv: provider.Provider, envs: []con
 /// the user doesn't have to remember which env file matches their shell.
 fn printSourceHints(p: paths_mod.Paths) !void {
     var buf: [2048]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&buf);
+    var stdout_w = std.Io.File.stdout().writer(runtime.io(), &buf);
     const out = &stdout_w.interface;
     try out.writeAll("\nTo make these available in your shell, add one of these to your rc:\n");
     for (provider.all) |pv| {
@@ -237,11 +238,11 @@ const Map = struct {
 
 /// Read the 32-byte master key from disk. Rejects truncated/corrupt files.
 fn readMasterKey(path: []const u8) !crypto_mod.Key {
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(runtime.io(), path, std.heap.page_allocator, .limited(crypto_mod.key_length + 1));
+    defer std.heap.page_allocator.free(bytes);
+    if (bytes.len != crypto_mod.key_length) return error.InvalidKeyFile;
     var key: crypto_mod.Key = undefined;
-    const n = try file.readAll(&key);
-    if (n != key.len) return error.InvalidKeyFile;
+    @memcpy(&key, bytes);
     return key;
 }
 
@@ -250,10 +251,10 @@ fn readMasterKey(path: []const u8) !crypto_mod.Key {
 /// on the first push. Allowed entries: `.git`, `secrets.enc`, any `README*`,
 /// `.gitignore`.
 fn checkRepoSafety(state_dir: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(state_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(runtime.io(), state_dir, .{ .iterate = true });
+    defer dir.close(runtime.io());
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(runtime.io())) |entry| {
         if (std.mem.eql(u8, entry.name, ".git")) continue;
         if (std.mem.eql(u8, entry.name, "secrets.enc")) continue;
         if (std.mem.startsWith(u8, entry.name, "README")) continue;
@@ -288,7 +289,7 @@ fn emitEnvLines(gpa: std.mem.Allocator, map: *const Map) ![]u8 {
     while (it.next()) |e| try keys.append(gpa, e.key_ptr.*);
     std.mem.sort([]const u8, keys.items, {}, lessThan);
 
-    var aw: std.io.Writer.Allocating = .init(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
     for (keys.items) |k| {
@@ -320,14 +321,14 @@ fn drainPending(
         drained.deinit(gpa);
     }
 
-    var dir = std.fs.cwd().openDir(pending_dir, .{ .iterate = true }) catch |e| switch (e) {
+    var dir = std.Io.Dir.cwd().openDir(runtime.io(), pending_dir, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => return drained,
         else => return e,
     };
-    defer dir.close();
+    defer dir.close(runtime.io());
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(runtime.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".enc")) continue;
         const key = entry.name[0 .. entry.name.len - 4];
@@ -335,7 +336,7 @@ fn drainPending(
         const full = try std.fs.path.join(gpa, &.{ pending_dir, entry.name });
         errdefer gpa.free(full);
 
-        const blob = try std.fs.cwd().readFileAlloc(gpa, full, 1 * 1024 * 1024);
+        const blob = try std.Io.Dir.cwd().readFileAlloc(runtime.io(), full, gpa, .limited(1 * 1024 * 1024));
         defer gpa.free(blob);
 
         const plaintext = try crypto_mod.decrypt(gpa, blob, master);
@@ -385,20 +386,20 @@ fn pruneByConfig(gpa: std.mem.Allocator, map: *Map, cfg: *const config_mod.Confi
 /// Write `bytes` to `path` atomically: write to `path.tmp`, fsync, then
 /// rename over `path`. A concurrent shell sourcing the target file always
 /// sees either the old or the new contents — never a half-written file.
-fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void {
+fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: std.posix.mode_t) !void {
     const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
     defer gpa.free(tmp_path);
 
     {
-        var file = try std.fs.cwd().createFile(tmp_path, .{
-            .mode = mode,
+        var file = try std.Io.Dir.cwd().createFile(runtime.io(), tmp_path, .{
+            .permissions = .fromMode(mode),
             .truncate = true,
         });
-        defer file.close();
-        try file.writeAll(bytes);
-        try file.sync();
+        defer file.close(runtime.io());
+        try file.writeStreamingAll(runtime.io(), bytes);
+        try file.sync(runtime.io());
     }
-    try std.fs.cwd().rename(tmp_path, path);
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, runtime.io());
 }
 
 fn parseSyncConfig(gpa: std.mem.Allocator, src: []const u8) !config_mod.Config {

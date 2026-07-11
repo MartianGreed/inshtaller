@@ -11,7 +11,7 @@ pub const Secret = struct {
         return self._value;
     }
 
-    pub fn format(self: Secret, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: Secret, w: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
         try w.writeAll("[REDACTED]");
     }

@@ -89,7 +89,7 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) !Config {
     return cfg;
 }
 
-pub fn emit(w: *std.io.Writer, cfg: Config) !void {
+pub fn emit(w: *std.Io.Writer, cfg: Config) !void {
     try w.print("version: {d}\n", .{cfg.version});
     try w.writeAll("backend:\n");
     try w.print("  repo: {s}\n", .{cfg.repo});
@@ -100,7 +100,7 @@ pub fn emit(w: *std.io.Writer, cfg: Config) !void {
 }
 
 pub fn emitToOwnedSlice(gpa: std.mem.Allocator, cfg: Config) ![]u8 {
-    var aw: std.io.Writer.Allocating = .init(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try emit(&aw.writer, cfg);
     return aw.toOwnedSlice();

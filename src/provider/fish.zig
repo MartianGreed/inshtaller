@@ -11,17 +11,17 @@ pub const provider: iface.Provider = .{
     .writeSourceCommandFn = writeSourceCommand,
 };
 
-fn writeExport(w: *std.io.Writer, env: iface.Env) std.io.Writer.Error!void {
+fn writeExport(w: *std.Io.Writer, env: iface.Env) std.Io.Writer.Error!void {
     try w.print("set -gx {s} ", .{env.key});
     try writeSingleQuoted(w, env.value);
     try w.writeByte('\n');
 }
 
-fn writeSourceCommand(w: *std.io.Writer, path: []const u8) std.io.Writer.Error!void {
+fn writeSourceCommand(w: *std.Io.Writer, path: []const u8) std.Io.Writer.Error!void {
     try w.print("source {s}", .{path});
 }
 
-fn writeSingleQuoted(w: *std.io.Writer, s: []const u8) !void {
+fn writeSingleQuoted(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('\'');
     for (s) |c| {
         switch (c) {
@@ -35,7 +35,7 @@ fn writeSingleQuoted(w: *std.io.Writer, s: []const u8) !void {
 
 test "fish writeExport uses set -gx" {
     const gpa = std.testing.allocator;
-    var aw: std.io.Writer.Allocating = .init(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try writeExport(&aw.writer, .{ .key = "FOO", .value = "simple" });
     try std.testing.expectEqualStrings("set -gx FOO 'simple'\n", aw.writer.buffered());
@@ -43,7 +43,7 @@ test "fish writeExport uses set -gx" {
 
 test "fish escapes single quotes and backslashes" {
     const gpa = std.testing.allocator;
-    var aw: std.io.Writer.Allocating = .init(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try writeExport(&aw.writer, .{ .key = "X", .value = "it's \\ok" });
     try std.testing.expectEqualStrings("set -gx X 'it\\'s \\\\ok'\n", aw.writer.buffered());

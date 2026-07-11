@@ -6,7 +6,7 @@ pub const askpass_env = "INSH_ASKPASS";
 pub const RunError = error{
     GitFailed,
     CredentialedRepoUrl,
-} || std.process.Child.RunError || std.mem.Allocator.Error;
+} || std.process.RunError || std.mem.Allocator.Error;
 
 pub const Result = struct {
     stdout: []u8,
@@ -27,11 +27,13 @@ pub const Result = struct {
 
 pub fn run(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     argv: []const []const u8,
     cwd: ?[]const u8,
     self_exe: []const u8,
 ) !Result {
-    return runOpts(gpa, argv, cwd, self_exe, .{});
+    return runOpts(gpa, io, environ, argv, cwd, self_exe, .{});
 }
 
 pub const RunOptions = struct {
@@ -42,27 +44,29 @@ pub const RunOptions = struct {
 
 pub fn runOpts(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     argv: []const []const u8,
     cwd: ?[]const u8,
     self_exe: []const u8,
     opts: RunOptions,
 ) !Result {
-    var env = try std.process.getEnvMap(gpa);
+    var env = try environ.clone(gpa);
     defer env.deinit();
     try env.put("GIT_ASKPASS", self_exe);
     try env.put(askpass_env, "1");
     try env.put("GIT_TERMINAL_PROMPT", "0");
 
-    const result = try std.process.Child.run(.{
-        .allocator = gpa,
+    const result = try std.process.run(gpa, io, .{
         .argv = argv,
-        .cwd = cwd,
-        .env_map = &env,
-        .max_output_bytes = 4 * 1024 * 1024,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = &env,
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(4 * 1024 * 1024),
     });
 
     const code: u8 = switch (result.term) {
-        .Exited => |c| c,
+        .exited => |c| c,
         else => 255,
     };
 
@@ -93,7 +97,7 @@ fn argvForLog(argv: []const []const u8) ArgvFormatter {
 const ArgvFormatter = struct {
     argv: []const []const u8,
 
-    pub fn format(self: ArgvFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: ArgvFormatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
         for (self.argv, 0..) |arg, i| {
             if (i > 0) try w.writeByte(' ');
             try writeRedactedUrl(w, arg);
@@ -104,7 +108,7 @@ const ArgvFormatter = struct {
 const TextFormatter = struct {
     text: []const u8,
 
-    pub fn format(self: TextFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: TextFormatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var i: usize = 0;
         while (i < self.text.len) {
             const scheme_idx = std.mem.indexOfPos(u8, self.text, i, "://") orelse {
@@ -143,7 +147,7 @@ pub fn redactText(text: []const u8) TextFormatter {
 const RedactedUrlFormatter = struct {
     url: []const u8,
 
-    pub fn format(self: RedactedUrlFormatter, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: RedactedUrlFormatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try writeRedactedUrl(w, self.url);
     }
 };
@@ -163,15 +167,17 @@ pub fn injectUsername(gpa: std.mem.Allocator, url: []const u8) ![]u8 {
     return gpa.dupe(u8, url);
 }
 
-pub fn isRepoInitialized(state_dir: []const u8, gpa: std.mem.Allocator) !bool {
+pub fn isRepoInitialized(state_dir: []const u8, gpa: std.mem.Allocator, io: std.Io) !bool {
     const git_dir = try std.fs.path.join(gpa, &.{ state_dir, ".git" });
     defer gpa.free(git_dir);
-    std.fs.cwd().access(git_dir, .{}) catch return false;
+    std.Io.Dir.cwd().access(io, git_dir, .{}) catch return false;
     return true;
 }
 
 pub fn cloneOrFetch(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     repo_url: []const u8,
     dest: []const u8,
     self_exe: []const u8,
@@ -181,29 +187,31 @@ pub fn cloneOrFetch(
     const auth_url = try injectUsername(gpa, repo_url);
     defer gpa.free(auth_url);
 
-    if (try isRepoInitialized(dest, gpa)) {
-        var r1 = try run(gpa, &.{ "git", "-C", dest, "fetch", "--prune", "origin" }, null, self_exe);
+    if (try isRepoInitialized(dest, gpa, io)) {
+        var r1 = try run(gpa, io, environ, &.{ "git", "-C", dest, "fetch", "--prune", "origin" }, null, self_exe);
         defer r1.deinit();
         if (!r1.ok()) return error.GitFailed;
 
-        if (try hasRemoteHead(gpa, dest, self_exe)) {
-            var r2 = try run(gpa, &.{ "git", "-C", dest, "reset", "--hard", "origin/HEAD" }, null, self_exe);
+        if (try hasRemoteHead(gpa, io, environ, dest, self_exe)) {
+            var r2 = try run(gpa, io, environ, &.{ "git", "-C", dest, "reset", "--hard", "origin/HEAD" }, null, self_exe);
             defer r2.deinit();
             if (!r2.ok()) return error.GitFailed;
         } else {
             log.info("remote has no commits yet; local state will be the first push", .{});
         }
     } else {
-        std.fs.cwd().makePath(dest) catch {};
-        var r = try run(gpa, &.{ "git", "clone", auth_url, dest }, null, self_exe);
+        std.Io.Dir.cwd().createDirPath(io, dest) catch {};
+        var r = try run(gpa, io, environ, &.{ "git", "clone", auth_url, dest }, null, self_exe);
         defer r.deinit();
         if (!r.ok()) return error.GitFailed;
     }
 }
 
-fn hasRemoteHead(gpa: std.mem.Allocator, dest: []const u8, self_exe: []const u8) !bool {
+fn hasRemoteHead(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, dest: []const u8, self_exe: []const u8) !bool {
     var r = try runOpts(
         gpa,
+        io,
+        environ,
         &.{ "git", "-C", dest, "rev-parse", "--verify", "--quiet", "origin/HEAD" },
         null,
         self_exe,
@@ -215,31 +223,33 @@ fn hasRemoteHead(gpa: std.mem.Allocator, dest: []const u8, self_exe: []const u8)
 
 pub fn commitAndPush(
     gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     dest: []const u8,
     message: []const u8,
     self_exe: []const u8,
 ) !void {
-    var r1 = try run(gpa, &.{ "git", "-C", dest, "add", "-A" }, null, self_exe);
+    var r1 = try run(gpa, io, environ, &.{ "git", "-C", dest, "add", "-A" }, null, self_exe);
     defer r1.deinit();
     if (!r1.ok()) return error.GitFailed;
 
-    var r_status = try run(gpa, &.{ "git", "-C", dest, "status", "--porcelain" }, null, self_exe);
+    var r_status = try run(gpa, io, environ, &.{ "git", "-C", dest, "status", "--porcelain" }, null, self_exe);
     defer r_status.deinit();
     if (!r_status.ok()) return error.GitFailed;
     if (std.mem.trim(u8, r_status.stdout, " \t\r\n").len == 0) {
         return;
     }
 
-    var r2 = try run(gpa, &.{ "git", "-C", dest, "-c", "user.email=insh@localhost", "-c", "user.name=insh", "commit", "-m", message }, null, self_exe);
+    var r2 = try run(gpa, io, environ, &.{ "git", "-C", dest, "-c", "user.email=insh@localhost", "-c", "user.name=insh", "commit", "-m", message }, null, self_exe);
     defer r2.deinit();
     if (!r2.ok()) return error.GitFailed;
 
-    var r3 = try run(gpa, &.{ "git", "-C", dest, "push", "origin", "HEAD" }, null, self_exe);
+    var r3 = try run(gpa, io, environ, &.{ "git", "-C", dest, "push", "origin", "HEAD" }, null, self_exe);
     defer r3.deinit();
     if (!r3.ok()) return error.GitFailed;
 }
 
-fn writeRedactedUrl(w: *std.io.Writer, url: []const u8) std.io.Writer.Error!void {
+fn writeRedactedUrl(w: *std.Io.Writer, url: []const u8) std.Io.Writer.Error!void {
     const range = userInfoRange(url) orelse {
         try w.writeAll(url);
         return;

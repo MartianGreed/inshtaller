@@ -10,5 +10,10 @@ pub const provider = @import("provider.zig");
 pub const Secret = log.Secret;
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    _ = paths;
+    _ = config;
+    _ = crypto;
+    _ = git;
+    _ = log;
+    _ = provider;
 }

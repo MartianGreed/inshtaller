@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 
 const AEAD = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
@@ -17,13 +18,13 @@ pub const DecryptError = error{
 
 pub fn generateKey() Key {
     var key: Key = undefined;
-    std.crypto.random.bytes(&key);
+    runtime.io().random(&key);
     return key;
 }
 
 pub fn encrypt(gpa: std.mem.Allocator, plaintext: []const u8, key: Key) ![]u8 {
     var nonce: [nonce_length]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    runtime.io().random(&nonce);
 
     const out = try gpa.alloc(u8, nonce_length + plaintext.len + tag_length);
     errdefer gpa.free(out);

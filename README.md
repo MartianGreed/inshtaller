@@ -108,6 +108,7 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
 | `insh add --type env --key K [--stdin]` | Stage a new env var. By default `insh` prompts for the value with input hidden; pass `--stdin` to read it from stdin instead. The value is encrypted immediately and the key name is added to `config.yaml`. Nothing touches the network. |
 | `insh sync` | Two-way sync. Pulls the backend repo, decrypts whatever's there, merges in any keys staged locally, re-encrypts, pushes, and writes one env file per supported shell (`env.sh`, `env.fish`, `env.nu`). |
 | `insh edit` | Opens `$EDITOR` on `config.yaml` so you can reorder or remove keys. The config never contains values, so this is safe. Removing a key here and then running `insh sync` drops that key from the backend `secrets.enc` and from every generated env file. |
+| `insh export-key` | Prints the master key as the 64-character lowercase hexadecimal format accepted by `insh init --key-prompt`. The output is secret and should only be sent through a trusted channel. |
 | `insh help` / `insh version` | Self-explanatory. |
 
 ## Multi-machine setup
@@ -120,12 +121,11 @@ Open a new shell and `$OPENAI_API_KEY` is set. Done.
    provide a PAT; the PAT can differ per machine.
 4. `insh sync` on B — your vars appear in the generated env files.
 
-For password managers that store text, convert the key to hex on machine A
-with `xxd -p -c 32 ~/.inshtaller/master.key`, then run
-`insh init --key-prompt` on machine B and paste the 64-character value into
-the hidden prompt. Key material is deliberately never accepted directly in a
-command-line argument, where shell history and process listings could expose
-it.
+For password managers that store text, run `insh export-key` on machine A and
+store its 64-character output as a secret. Then run `insh init --key-prompt`
+on machine B and paste that value into the hidden prompt. Key material is
+deliberately never accepted directly in a command-line argument, where shell
+history and process listings could expose it.
 
 If machine B already has the same key, init safely reuses it. If it has a
 different key, init refuses to replace it unless `--force` is also supplied.

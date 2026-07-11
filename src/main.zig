@@ -8,6 +8,7 @@ const cli_init = @import("cli/init.zig");
 const cli_sync = @import("cli/sync.zig");
 const cli_edit = @import("cli/edit.zig");
 const cli_add = @import("cli/add.zig");
+const cli_export_key = @import("cli/export_key.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -40,6 +41,8 @@ pub fn main(init: std.process.Init) !void {
         try cli_edit.run(gpa, home, init.environ_map.get("EDITOR") orelse "vi", init.io);
     } else if (std.mem.eql(u8, cmd, "add")) {
         try cli_add.run(gpa, home, argv[2..]);
+    } else if (std.mem.eql(u8, cmd, "export-key")) {
+        try cli_export_key.run(gpa, home, argv[2..]);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
@@ -96,6 +99,8 @@ fn printUsage() !void {
         \\                                    shell (bash/zsh, fish, nushell); pushes any
         \\                                    locally staged keys to the backend.
         \\  edit                              Open $EDITOR on the config file (never has values).
+        \\  export-key                        Print the master key as 64 hex characters for
+        \\                                    `insh init --key-prompt`. Treat output as secret.
         \\  help                              Show this help.
         \\  version                           Show version.
         \\
@@ -126,4 +131,5 @@ test {
     _ = cli_sync;
     _ = cli_edit;
     _ = cli_add;
+    _ = cli_export_key;
 }

@@ -1,74 +1,24 @@
 const std = @import("std");
 const paths_mod = @import("../paths.zig");
-const crypto_mod = @import("../crypto.zig");
-const config_mod = @import("../config.zig");
 const log = @import("../log.zig");
-const Secret = @import("../log.zig").Secret;
 const runtime = @import("../runtime.zig");
+const secrets = @import("../secrets.zig");
 
-pub fn run(gpa: std.mem.Allocator, home: []const u8, args: []const []const u8) !void {
-    const parsed = parseArgs(args) catch |e| switch (e) {
-        error.InsecureValueArgument => {
-            log.err("--value is no longer accepted because argv is visible to other local processes; use the hidden prompt or pass --stdin", .{});
-            return e;
-        },
-        else => return e,
+pub fn run(gpa: std.mem.Allocator, p: paths_mod.Paths, namespace: []const u8, args: []const []const u8, remove: bool) !void {
+    const parsed = parseArgs(args) catch |e| {
+        if (e == error.InsecureValueArgument) log.err("use the hidden prompt or --stdin; secret values cannot be passed in argv", .{});
+        return e;
     };
-
-    if (!std.mem.eql(u8, parsed.type_s, "env")) {
-        log.err("unsupported --type: {s} (only 'env' is supported in v1)", .{parsed.type_s});
-        return error.UnsupportedType;
-    }
-
-    if (!isValidKey(parsed.key)) {
-        log.err("invalid --key: {s} (must match [A-Za-z_][A-Za-z0-9_]*)", .{parsed.key});
-        return error.InvalidKey;
-    }
-
-    const value = try readSecretValue(gpa, parsed.read_from_stdin);
-    defer gpa.free(value);
-
-    var p = try paths_mod.Paths.init(gpa, home);
-    defer p.deinit();
-
-    const key_path = try p.masterKey();
-    defer gpa.free(key_path);
-    const master: crypto_mod.Key = readMasterKey(key_path) catch |e| {
-        log.err("could not read master key at {s}: {s}", .{ key_path, @errorName(e) });
-        return error.NoMasterKey;
-    };
-
-    const cfg_path = try p.config();
-    defer gpa.free(cfg_path);
-    const cfg_src = std.Io.Dir.cwd().readFileAlloc(runtime.io(), cfg_path, gpa, .limited(1 * 1024 * 1024)) catch |e| {
-        log.err("could not read {s}: {s}. Run `insh init` first.", .{ cfg_path, @errorName(e) });
-        return error.NotInitialized;
-    };
-    defer gpa.free(cfg_src);
-
-    var cfg = try config_mod.parse(gpa, cfg_src);
-    defer cfg.deinit();
-
-    try cfg.addKey(parsed.key);
-    const new_src = try config_mod.emitToOwnedSlice(gpa, cfg);
-    defer gpa.free(new_src);
-    try atomicWriteFile(gpa, cfg_path, new_src, 0o644);
-
-    const pending_dir = try p.pending();
-    defer gpa.free(pending_dir);
-    try std.Io.Dir.cwd().createDirPath(runtime.io(), pending_dir);
-
-    const enc = try crypto_mod.encrypt(gpa, value, master);
-    defer gpa.free(enc);
-
-    const enc_name = try std.fmt.allocPrint(gpa, "{s}.enc", .{parsed.key});
-    defer gpa.free(enc_name);
-    const enc_path = try std.fs.path.join(gpa, &.{ pending_dir, enc_name });
-    defer gpa.free(enc_path);
-
-    try atomicWriteFile(gpa, enc_path, enc, 0o600);
-
-    log.info("added key {s} (value {f}); run `insh sync` to push to backend", .{ parsed.key, Secret.wrap(value) });
+    if (!std.mem.eql(u8, parsed.type_s, "env")) return error.UnsupportedType;
+    if (!secrets.validKey(parsed.key)) return error.InvalidKey;
+    if (namespace.len > 0 and !secrets.validNamespace(namespace)) return error.InvalidNamespace;
+    try @import("../profiles.zig").require(p);
+    const master = try secrets.masterKey(p);
+    if (remove and parsed.read_from_stdin) return error.UnknownArg;
+    const value = if (remove) null else try readSecretValue(gpa, parsed.read_from_stdin);
+    defer if (value) |v| gpa.free(v);
+    try secrets.stage(p, master, .{ .namespace = namespace, .key = parsed.key, .value = value });
+    log.info("staged {s} for key {s}; run `insh sync` to push", .{ if (remove) "removal" else "value", parsed.key });
 }
 
 const ParsedArgs = struct {
@@ -121,7 +71,7 @@ fn readSecretValue(gpa: std.mem.Allocator, read_from_stdin: bool) ![]u8 {
         var buffer: [4096]u8 = undefined;
         var reader = std.Io.File.stdin().readerStreaming(runtime.io(), &buffer);
         const raw = try reader.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024));
-        errdefer gpa.free(raw);
+        defer gpa.free(raw);
         const trimmed = std.mem.trim(u8, raw, "\r\n");
         if (trimmed.len == 0) return error.MissingValue;
         return gpa.dupe(u8, trimmed);
@@ -146,25 +96,6 @@ fn readSecretValue(gpa: std.mem.Allocator, read_from_stdin: bool) ![]u8 {
     const trimmed = std.mem.trim(u8, raw, "\r\n");
     if (trimmed.len == 0) return error.MissingValue;
     return gpa.dupe(u8, trimmed);
-}
-
-fn isValidKey(key: []const u8) bool {
-    if (key.len == 0) return false;
-    const first = key[0];
-    if (!(std.ascii.isAlphabetic(first) or first == '_')) return false;
-    for (key[1..]) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
-    }
-    return true;
-}
-
-fn readMasterKey(path: []const u8) !crypto_mod.Key {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(runtime.io(), path, std.heap.page_allocator, .limited(crypto_mod.key_length + 1));
-    defer std.heap.page_allocator.free(bytes);
-    if (bytes.len != crypto_mod.key_length) return error.InvalidKeyFile;
-    var key: crypto_mod.Key = undefined;
-    @memcpy(&key, bytes);
-    return key;
 }
 
 fn promptLine(
@@ -202,34 +133,18 @@ fn promptLine(
     return gpa.dupe(u8, line);
 }
 
-fn atomicWriteFile(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: std.posix.mode_t) !void {
-    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-    defer gpa.free(tmp_path);
-
-    {
-        var file = try std.Io.Dir.cwd().createFile(runtime.io(), tmp_path, .{
-            .permissions = .fromMode(mode),
-            .truncate = true,
-        });
-        defer file.close(runtime.io());
-        try file.writeStreamingAll(runtime.io(), bytes);
-        try file.sync(runtime.io());
-    }
-    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, runtime.io());
-}
-
 test "isValidKey accepts standard env names" {
-    try std.testing.expect(isValidKey("FOO"));
-    try std.testing.expect(isValidKey("FOO_BAR"));
-    try std.testing.expect(isValidKey("_private"));
-    try std.testing.expect(isValidKey("A1"));
+    try std.testing.expect(secrets.validKey("FOO"));
+    try std.testing.expect(secrets.validKey("FOO_BAR"));
+    try std.testing.expect(secrets.validKey("_private"));
+    try std.testing.expect(secrets.validKey("A1"));
 }
 
 test "isValidKey rejects bad names" {
-    try std.testing.expect(!isValidKey(""));
-    try std.testing.expect(!isValidKey("1FOO"));
-    try std.testing.expect(!isValidKey("FOO-BAR"));
-    try std.testing.expect(!isValidKey("FOO BAR"));
+    try std.testing.expect(!secrets.validKey(""));
+    try std.testing.expect(!secrets.validKey("1FOO"));
+    try std.testing.expect(!secrets.validKey("FOO-BAR"));
+    try std.testing.expect(!secrets.validKey("FOO BAR"));
 }
 
 test "parseArgs rejects insecure value flag" {

@@ -15,6 +15,16 @@ pub const Paths = struct {
         return .{ .gpa = gpa, .home = home_copy, .root = root };
     }
 
+    pub fn initProfile(gpa: std.mem.Allocator, home: []const u8, name: []const u8) !Paths {
+        if (!@import("profiles.zig").validName(name)) return error.InvalidProfile;
+        var p = try init(gpa, home);
+        errdefer p.deinit();
+        const root = try p.join(&.{ "profiles", name });
+        gpa.free(p.root);
+        p.root = root;
+        return p;
+    }
+
     pub fn deinit(self: *Paths) void {
         self.gpa.free(self.home);
         self.gpa.free(self.root);

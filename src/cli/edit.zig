@@ -4,10 +4,7 @@ const config_mod = @import("../config.zig");
 const git_mod = @import("../git.zig");
 const log = @import("../log.zig");
 
-pub fn run(gpa: std.mem.Allocator, home: []const u8, editor: []const u8, io: std.Io) !void {
-    var p = try paths_mod.Paths.init(gpa, home);
-    defer p.deinit();
-
+pub fn run(gpa: std.mem.Allocator, p: paths_mod.Paths, editor: []const u8, io: std.Io) !void {
     const cfg_path = try p.config();
     defer gpa.free(cfg_path);
 

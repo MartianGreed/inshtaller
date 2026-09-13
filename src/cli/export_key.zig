@@ -4,14 +4,13 @@ const crypto_mod = @import("../crypto.zig");
 const runtime = @import("../runtime.zig");
 const log = @import("../log.zig");
 
-pub fn run(gpa: std.mem.Allocator, home: []const u8, args: []const []const u8) !void {
+pub fn run(gpa: std.mem.Allocator, p: paths_mod.Paths, args: []const []const u8) !void {
     validateArgs(args) catch |err| {
         log.err("unknown argument: {s}", .{args[0]});
         return err;
     };
 
-    var paths = try paths_mod.Paths.init(gpa, home);
-    defer paths.deinit();
+    const paths = p;
 
     const key_path = try paths.masterKey();
     defer gpa.free(key_path);

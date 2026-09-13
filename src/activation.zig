@@ -115,8 +115,13 @@ fn emit(gpa: std.mem.Allocator, shell: provider.Shell, changes: *std.StringHashM
                 try provider.byShell(shell).writeExport(&line.writer, .{ .key = k, .value = v });
                 const bytes = line.writer.buffered();
                 try out.writer.writeAll(bytes[0 .. bytes.len - 1]);
+            } else if (shell == .fish) {
+                // Fish returns status 4 for an absent variable. Cleanup is
+                // idempotent, but real failures must still abort the transition.
+                try out.writer.print("if set -q {s}; set -e {s}; or return 1; end\n", .{ k, k });
+                continue;
             } else {
-                try out.writer.print("{s} {s}", .{ if (shell == .fish) "set -e" else "unset", k });
+                try out.writer.print("unset {s}", .{k});
             }
             try out.writer.writeAll(if (shell == .fish) "; or return 1\n" else " || return 1\n");
         }

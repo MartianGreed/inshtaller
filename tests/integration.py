@@ -342,5 +342,15 @@ insh deactivate
                 self.assertIsNone(child['ONLY_P1'])
                 self.assertEqual(child['INSH_NAMESPACES'], '')
 
+    def test_repeated_deactivation_is_idempotent(self):
+        self.add('API_KEY', 'personal')
+        for shell in ['bash', 'zsh', 'fish', 'nu']:
+            with self.subTest(shell=shell):
+                deactivate = 'insh deactivate'
+                if shell in ['bash', 'zsh']: deactivate += ' || exit 77'
+                elif shell == 'fish': deactivate += '; or exit 77'
+                result = self.shell_run(shell, deactivate + '\n' + deactivate + '\n@inspect', {'API_KEY': 'local'})
+                self.assertEqual(result[0]['API_KEY'], 'local')
+
 if __name__ == '__main__':
     unittest.main()

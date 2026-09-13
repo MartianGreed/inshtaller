@@ -23,6 +23,10 @@ pub fn generateKey() Key {
 }
 
 pub fn encrypt(gpa: std.mem.Allocator, plaintext: []const u8, key: Key) ![]u8 {
+    return encryptWithAd(gpa, plaintext, key, format_version);
+}
+
+fn encryptWithAd(gpa: std.mem.Allocator, plaintext: []const u8, key: Key, ad: []const u8) ![]u8 {
     var nonce: [nonce_length]u8 = undefined;
     runtime.io().random(&nonce);
 
@@ -36,7 +40,7 @@ pub fn encrypt(gpa: std.mem.Allocator, plaintext: []const u8, key: Key) ![]u8 {
         out[nonce_length..][0..plaintext.len],
         &tag,
         plaintext,
-        format_version,
+        ad,
         nonce,
         key,
     );
@@ -45,6 +49,11 @@ pub fn encrypt(gpa: std.mem.Allocator, plaintext: []const u8, key: Key) ![]u8 {
 }
 
 pub fn decrypt(gpa: std.mem.Allocator, blob: []const u8, key: Key) ![]u8 {
+    if (std.mem.startsWith(u8, blob, "INSH2\n")) return decryptWithAd(gpa, blob[6..], key, "insh:v2");
+    return decryptWithAd(gpa, blob, key, format_version);
+}
+
+fn decryptWithAd(gpa: std.mem.Allocator, blob: []const u8, key: Key, ad: []const u8) ![]u8 {
     if (blob.len < nonce_length + tag_length) return DecryptError.BlobTooSmall;
     const ct_len = blob.len - nonce_length - tag_length;
 
@@ -59,7 +68,7 @@ pub fn decrypt(gpa: std.mem.Allocator, blob: []const u8, key: Key) ![]u8 {
         plaintext,
         blob[nonce_length..][0..ct_len],
         tag,
-        format_version,
+        ad,
         nonce,
         key,
     ) catch {
@@ -111,4 +120,23 @@ test "decrypt rejects too-small blob" {
     const key = generateKey();
     const tiny = [_]u8{0} ** 8;
     try std.testing.expectError(DecryptError.BlobTooSmall, decrypt(gpa, &tiny, key));
+}
+
+/// Distinct authenticated version makes old clients fail closed instead of
+/// interpreting namespaced JSON as an empty legacy backend and deleting it.
+pub fn encryptV2(gpa: std.mem.Allocator, plaintext: []const u8, key: Key) ![]u8 {
+    const blob = try encryptWithAd(gpa, plaintext, key, "insh:v2");
+    defer gpa.free(blob);
+    return std.mem.concat(gpa, u8, &.{ "INSH2\n", blob });
+}
+
+test "v2 authenticates its version and remains readable by new clients" {
+    const gpa = std.testing.allocator;
+    const key = generateKey();
+    const blob = try encryptV2(gpa, "payload", key);
+    defer gpa.free(blob);
+    const pt = try decrypt(gpa, blob, key);
+    defer gpa.free(pt);
+    try std.testing.expectEqualStrings("payload", pt);
+    try std.testing.expectError(error.AuthenticationFailed, decryptWithAd(gpa, blob[6..], key, format_version));
 }

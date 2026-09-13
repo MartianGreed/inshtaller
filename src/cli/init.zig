@@ -17,7 +17,7 @@ const ParsedArgs = struct {
     force: bool = false,
 };
 
-pub fn run(gpa: std.mem.Allocator, home: []const u8, github_token: ?[]const u8, args: []const []const u8) !void {
+pub fn run(gpa: std.mem.Allocator, p: paths_mod.Paths, github_token: ?[]const u8, args: []const []const u8) !void {
     const parsed = parseArgs(args) catch |e| {
         switch (e) {
             error.MissingValue => log.err("--key-file requires a path", .{}),
@@ -28,9 +28,6 @@ pub fn run(gpa: std.mem.Allocator, home: []const u8, github_token: ?[]const u8, 
         }
         return e;
     };
-
-    var p = try paths_mod.Paths.init(gpa, home);
-    defer p.deinit();
 
     try p.ensureRoot();
 
@@ -136,10 +133,11 @@ pub fn run(gpa: std.mem.Allocator, home: []const u8, github_token: ?[]const u8, 
 
     try stdout.writeAll("\nDone. Next steps:\n");
     try stdout.print("  1) Transfer {s} through a trusted channel when adding another machine.\n", .{key_path});
-    try stdout.writeAll("  2) Add env vars:      insh add --type env --key NAME      # hidden prompt\n");
-    try stdout.writeAll("                         printf 'VALUE' | insh add --type env --key NAME --stdin\n");
-    try stdout.writeAll("  3) Sync to backend:   insh sync\n");
-    try stdout.writeAll("  4) Shell integration: echo 'source ~/.inshtaller/env.sh' >> ~/.zshrc\n");
+    const profile_name = std.fs.path.basename(p.root);
+    try stdout.print("  2) Add env vars: insh --profile {s} add --type env --key NAME\n", .{profile_name});
+    try stdout.print("  3) Sync: insh --profile {s} sync\n", .{profile_name});
+    try stdout.writeAll("  4) Enable shell integration with insh shell-init <shell>; see README setup.\n");
+    try stdout.print("  5) Select in this terminal: insh profile use {s}\n", .{profile_name});
     try stdout.flush();
 }
 

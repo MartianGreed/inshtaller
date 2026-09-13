@@ -188,6 +188,13 @@ pub fn cloneOrFetch(
     defer gpa.free(auth_url);
 
     if (try isRepoInitialized(dest, gpa, io)) {
+        var remote = try run(gpa, io, environ, &.{ "git", "-C", dest, "config", "--get", "remote.origin.url" }, null, self_exe);
+        defer remote.deinit();
+        if (!remote.ok()) return error.GitFailed;
+        if (!std.mem.eql(u8, std.mem.trim(u8, remote.stdout, "\r\n"), auth_url)) {
+            log.err("cached Git remote differs from profile config; create a new profile for another backend", .{});
+            return error.ProfileRepoMismatch;
+        }
         var r1 = try run(gpa, io, environ, &.{ "git", "-C", dest, "fetch", "--prune", "origin" }, null, self_exe);
         defer r1.deinit();
         if (!r1.ok()) return error.GitFailed;
@@ -201,7 +208,7 @@ pub fn cloneOrFetch(
         }
     } else {
         std.Io.Dir.cwd().createDirPath(io, dest) catch {};
-        var r = try run(gpa, io, environ, &.{ "git", "clone", auth_url, dest }, null, self_exe);
+        var r = try run(gpa, io, environ, &.{ "git", "clone", "--", auth_url, dest }, null, self_exe);
         defer r.deinit();
         if (!r.ok()) return error.GitFailed;
     }
@@ -218,7 +225,13 @@ fn hasRemoteHead(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
         .{ .quiet_on_failure = true },
     );
     defer r.deinit();
-    return r.ok();
+    if (r.ok()) return true;
+    // A clone of an empty repository may not acquire origin/HEAD on older
+    // Git versions after the first push. Discover it before deciding that
+    // there is no remote state to merge.
+    var refresh = try runOpts(gpa, io, environ, &.{ "git", "-C", dest, "remote", "set-head", "origin", "--auto" }, null, self_exe, .{ .quiet_on_failure = true });
+    defer refresh.deinit();
+    return refresh.ok();
 }
 
 pub fn commitAndPush(

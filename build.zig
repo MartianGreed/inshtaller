@@ -153,4 +153,8 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+    const integration_step = b.step("integration", "Run isolated CLI and shell acceptance tests (Python 3, bash, zsh, fish, nu)");
+    const integration = b.addSystemCommand(&.{ "python3", "tests/integration.py" });
+    integration.step.dependOn(b.getInstallStep());
+    integration_step.dependOn(&integration.step);
 }
